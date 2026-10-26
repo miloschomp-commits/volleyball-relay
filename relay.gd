@@ -25,7 +25,11 @@ extends SceneTree
 
 const PARTY_MAX := 4
 const BRACKET := 4              # teams in a tourney (4, 8, 16...): 4 = two semi-finals, then the final
-const TOURNEY_RULES := {"mode": "Classic", "points": 7, "strict": true}     # strict: net touch, no double touches
+const TOURNEY_RULES := {"mode": "Classic", "points": 11, "strict": true}     # strict: net touch, no double touches
+# Casual: the fun modes and courts a match may ask for (the game's Game.MODES and Game.SCENES)
+const MODES := ["Classic", "Big Ball", "Windy", "Spin Madness", "Rally Rush", "Hot Potato", "Heavy Ball", "Ghost Ball",
+	"Chaos", "Mega Chaos"]
+const SCENES := ["Basic", "Sky", "Basic Tall"]
 const GRACE := 45.0             # how long a tourney match waits for players still reading their last Game Over
 const LETTERS := "ABCDEFGHJKMNPQRSTUVWXYZ"     # no I, L or O: they look like 1 and 0
 const NAME_CHARS := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
@@ -34,10 +38,12 @@ var server := TCPServer.new()
 var peers: Array = []           # everyone connected: see _accept
 var parties := {}               # code -> {"members": {seat: peer}}   (seat 0 leads)
 var games := {}                 # id -> {"host": peer, "guests": {seat: peer}, "kind", "tourney", "match", "done"}
-var queues := {}                # "casual|1 v 1|Classic|7", "tourney|solo", "tourney|duo" -> [group, ...]
+var queues := {}                # "casual|1 v 1|Classic|7|Basic", "tourney|solo", "tourney|duo" -> [group, ...]
 var tourneys := {}              # id -> see _start_tourney
 var next_id := 1
 var clock := 0.0
+var lag := 0.0                  # testing: hold game bytes back this long (-- --lag=ms), like a slow connection
+var held_back: Array = []       # [when to send, peer, bytes]
 
 
 func _initialize() -> void:
@@ -47,6 +53,8 @@ func _initialize() -> void:
 	for arg: String in OS.get_cmdline_user_args():
 		if arg.begins_with("--port="):
 			port = int(arg.trim_prefix("--port="))
+		if arg.begins_with("--lag="):
+			lag = int(arg.trim_prefix("--lag=")) / 1000.0
 	Engine.max_fps = 120                         # plenty, without spinning the CPU
 	var err := server.listen(port, "*")
 	print("Volleyball relay %s on port %d" % ["listening" if err == OK else "FAILED (%d)" % err, port])
@@ -72,6 +80,9 @@ func _process(delta: float) -> bool:
 			peers.erase(p)
 	for t: Dictionary in tourneys.values():
 		_tourney_step(t)
+	while not held_back.is_empty() and held_back[0][0] <= clock:
+		var late: Array = held_back.pop_front()
+		_send_now(late[1], late[2])
 	return false
 
 
@@ -98,6 +109,13 @@ func _send(p: Dictionary, msg: Dictionary) -> void:
 
 
 func _send_bytes(p: Dictionary, data: PackedByteArray) -> void:
+	if lag > 0.0:
+		held_back.append([clock + lag, p, data])
+	else:
+		_send_now(p, data)
+
+
+func _send_now(p: Dictionary, data: PackedByteArray) -> void:
 	if p.open and (p.ws as WebSocketPeer).get_ready_state() == WebSocketPeer.STATE_OPEN:
 		(p.ws as WebSocketPeer).send(data)
 
@@ -179,7 +197,7 @@ static func _clean_name(raw) -> String:
 		if NAME_CHARS.contains(c):
 			out += c
 	out = out.strip_edges()
-	return out if out != "" else "Player"
+	return out if out != "" and not _rude(out) else "Player"
 
 
 static func _clean_look(raw) -> Dictionary:
@@ -293,7 +311,12 @@ func _casual(p: Dictionary, msg: Dictionary) -> void:
 		_error(p, "Only the party leader picks what to play.")
 		return
 	var format := "2 v 2" if str(msg.get("format", "")) == "2 v 2" else "1 v 1"
-	var mode := "Chaos" if str(msg.get("mode", "")) == "Chaos" else "Classic"
+	var mode := str(msg.get("mode", ""))
+	if not mode in MODES:
+		mode = "Classic"
+	var scene := str(msg.get("scene", ""))
+	if not scene in SCENES:
+		scene = "Basic"
 	var points := clampi(int(msg.get("points", 7)), 3, 21)
 	var group := _group(p)
 	if group.size() > (2 if format == "2 v 2" else 1):
@@ -302,12 +325,13 @@ func _casual(p: Dictionary, msg: Dictionary) -> void:
 	if group.any(func(m): return _busy(m)):
 		_error(p, "Someone in your party is busy.")
 		return
-	var key := "casual|%s|%s|%d" % [format, mode, points]
+	var key := "casual|%s|%s|%d|%s" % [format, mode, points, scene]
 	_enqueue(key, group)
 	var found := _form_teams(queues[key], 2 if format == "2 v 2" else 1, 2)
 	if not found.is_empty():
 		_dequeue(key, found.used)
-		_start_game(found.teams, "casual", {"mode": mode, "points": points}, 0, -1, 2 if format == "2 v 2" else 1)
+		_start_game(found.teams, "casual", {"mode": mode, "points": points, "scene": scene}, 0, -1,
+				2 if format == "2 v 2" else 1)
 
 
 func _tourney_entry(p: Dictionary, how: String) -> void:
@@ -613,3 +637,52 @@ func _gone(p: Dictionary) -> void:
 	_leave_game(p)
 	_leave_tourney(p)
 	_leave_party(p)
+# --- names: the same check as scripts/NameFilter.gd (a changed word list goes in both) ---
+
+const LEET := {"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", "@": "a", "$": "s", "!": "i"}
+# rude anywhere in a name, and rude only as a whole word (they're inside ordinary words)
+const ANYWHERE := "ZnVja3xmdWt8ZmNrfHNoaXR8Yml0Y2h8YnRjaHxjdW50fGRpY2t8Y29ja3xwdXNzeXxwZW5pc3x2YWdpbmF8d2hvcmV8c2x1dHxmYWd8bmlnZ2VyfG5pZ2dhfG5pZ2F8cmV0YXJkfHJhcGV8cmFwaXN0fG5heml8aGl0bGVyfHBvcm58c2V4fGJvb2J8YmFzdGFyZHx3YW5rfHR3YXR8a2trfHBpc3N8aml6enxkaWxkb3xob3JueXxraWxseW91cnNlbGZ8c3VpY2lkZXxtb2xlc3R8Y2hpbmt8a2lrZXx3ZXRiYWNrfHRyYW5ueXxnb29rfG1vdGhlcmZ8YXNzaG9sZXxhcnNlaG9sZXxkdW1iYXNzfGphY2thc3N8Ym9sbG9ja3x0ZXN0aWNsZXxvcmdhc218c2VtZW58bnVkZXxuYWtlZHxzdGZ1fHd0ZnxtaWxm"
+const WHOLE := "YXNzfGFyc2V8ZGFtbnxoZWxsfGNyYXB8dGl0fHRpdHN8Y3VtfGFuYWx8aG9lfGhvZXN8cHJpY2t8ZHlrZXxjb29ufHNwaWN8cGVkb3xiZWFuZXJ8a3lzfHNsYWd8dHVyZHxwb29wfHBlZQ=="
+const ALLOWED := ["peacock", "cockatoo", "cockatiel", "hancock", "shuttlecock", "grape", "drape", "scrape",
+	"trapeze", "therapist", "spice", "spicy", "scunthorpe", "sussex", "essex", "dickens"]
+
+
+static func _rude(name: String) -> bool:
+	# the words of the name: split at spaces, - and _, and where a capital starts a word (BigWord)
+	var spaced := ""
+	for i in name.length():
+		var c := name[i]
+		if i > 0 and c != c.to_lower() and name[i - 1] == name[i - 1].to_lower() and name[i - 1] != " ":
+			spaced += " "
+		spaced += c
+	var all := _plain(name)
+	for ok: String in ALLOWED:
+		all = all.replace(ok, "")
+	if _patterns(ANYWHERE, false).search(all) != null:
+		return true
+	var whole := _patterns(WHOLE, true)
+	for w in spaced.replace("-", " ").replace("_", " ").split(" ", false):
+		if whole.search(_plain(w)) != null:
+			return true
+	return false
+
+
+static func _plain(s: String) -> String:
+	var out := ""
+	for c in s.to_lower():
+		c = LEET.get(c, c)
+		if c >= "a" and c <= "z":
+			out += c
+	return out
+
+
+static func _patterns(encoded: String, whole: bool) -> RegEx:
+	var parts: Array = []
+	for w: String in Marshalls.base64_to_utf8(encoded).split("|"):
+		var p := ""
+		for c in w:
+			p += c + "+"
+		parts.append(p)
+	var r := RegEx.new()
+	r.compile(("^(%s)$" if whole else "(%s)") % "|".join(parts))
+	return r
