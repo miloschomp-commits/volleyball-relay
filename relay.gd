@@ -43,6 +43,9 @@ var tourneys := {}              # id -> see _start_tourney
 var next_id := 1
 var clock := 0.0
 var lag := 0.0                  # testing: hold game bytes back this long (-- --lag=ms), like a slow connection
+# The most players connected at once (MAX_PLAYERS on the host, or -- --max=N): anyone past it is
+# told the server's full (a small server stays smooth for those on it, rather than lagging for all)
+var max_players := 300
 var held_back: Array = []       # [when to send, peer, bytes]
 
 
@@ -50,7 +53,11 @@ func _initialize() -> void:
 	var port := 8910
 	if OS.get_environment("PORT") != "":
 		port = int(OS.get_environment("PORT"))
+	if OS.get_environment("MAX_PLAYERS") != "":
+		max_players = int(OS.get_environment("MAX_PLAYERS"))
 	for arg: String in OS.get_cmdline_user_args():
+		if arg.begins_with("--max="):
+			max_players = int(arg.trim_prefix("--max="))
 		if arg.begins_with("--port="):
 			port = int(arg.trim_prefix("--port="))
 		if arg.begins_with("--lag="):
@@ -67,6 +74,9 @@ func _process(delta: float) -> bool:
 	for p: Dictionary in peers.duplicate():
 		var ws: WebSocketPeer = p.ws
 		ws.poll()
+		if p.has("let_go") and clock >= p.let_go and p.open:
+			ws.close()                              # (told the server's full a moment ago)
+			p.open = false
 		var state := ws.get_ready_state()
 		if state == WebSocketPeer.STATE_OPEN:
 			while ws.get_available_packet_count() > 0:
@@ -87,6 +97,7 @@ func _process(delta: float) -> bool:
 
 
 func _accept(stream: StreamPeerTCP) -> void:
+	var busy := peers.size() >= max_players          # full: they're told so and let go (_request)
 	var ws := WebSocketPeer.new()
 	ws.inbound_buffer_size = 1 << 20
 	ws.outbound_buffer_size = 1 << 20
@@ -99,6 +110,7 @@ func _accept(stream: StreamPeerTCP) -> void:
 		"game": 0, "gseat": -1,                  # the game they're in, their seat in it
 		"queue": "",                             # what they're looking for (a key of queues)
 		"tourney": 0,                            # the tourney they're in (until they leave its screen)
+		"busy": busy,
 	})
 	next_id += 1
 
@@ -156,6 +168,13 @@ static func _with_seat(seat: int, data: PackedByteArray) -> PackedByteArray:
 
 
 func _request(p: Dictionary, text: String) -> void:
+	if p.busy:
+		# the server's full (MAX_PLAYERS): say so, and let them go a moment later (once it's
+		# gone), so the players on it play smoothly
+		if not p.has("let_go"):
+			_send(p, {"type": "busy", "why": "Online is full right now. Try again in a little while!"})
+			p.let_go = clock + 1.0
+		return
 	var msg = JSON.parse_string(text)
 	if not msg is Dictionary:
 		return
