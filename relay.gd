@@ -14,10 +14,10 @@ extends SceneTree
 #              BRACKET teams are in, then play a knockout. The server starts each match,
 #              hears who won, and tells everyone where they finished (rank points).
 #
-#  Matches run on one player's computer (the host); this server only passes their
-#  messages on, and never reads them:
-#      host  -> everyone else in the room   (the court, ~30 times a second)
-#      other -> the host                    (their buttons, with their seat number in front)
+#  Every computer in a match runs it, and they send each other their buttons; this server
+#  only passes their messages on, and never reads them:
+#      host  -> everyone else in the room
+#      other -> the host (with their seat number in front), and the other guests
 #  A GAME is a room the server makes (Casual, Tourney; the host is seat 0). A Custom match
 #  uses the party as its room (the leader hosts). Requests and replies are small JSON texts.
 #  ONLINE.md says how to put this on a free host so friends anywhere can reach it.
@@ -148,6 +148,9 @@ func _pass_on(p: Dictionary, data: PackedByteArray) -> void:
 				_send_bytes(m, data)
 		else:
 			_send_bytes(g.host, _with_seat(p.gseat, data))
+			for m: Dictionary in g.guests.values():     # (the other guests need their buttons too, straight away)
+				if m != p:
+					_send_bytes(m, data)
 	elif p.party != "":
 		var members: Dictionary = parties.get(p.party, {}).get("members", {})
 		var leader = members.get(0)
@@ -159,6 +162,9 @@ func _pass_on(p: Dictionary, data: PackedByteArray) -> void:
 					_send_bytes(m, data)
 		elif leader.game == 0:
 			_send_bytes(leader, _with_seat(p.pseat, data))
+			for m: Dictionary in members.values():
+				if m != p and m != leader and m.game == 0:
+					_send_bytes(m, data)
 
 
 static func _with_seat(seat: int, data: PackedByteArray) -> PackedByteArray:
@@ -182,8 +188,23 @@ func _request(p: Dictionary, text: String) -> void:
 		"hello":
 			p.name = _clean_name(msg.get("name", ""))
 			p.look = _clean_look(msg.get("look", {}))
+			_send(p, {"type": "welcome", "direct": true})     # (guests' game messages reach each other: _pass_on)
 			if p.party != "":
 				_party_update(p.party)
+		"stats":
+			# how many are on: connected, in a Casual / Tourney game, and looking for one (the
+			# game's online screens ask every few seconds)
+			var online := 0
+			var playing := 0
+			var looking := 0
+			for o: Dictionary in peers:
+				if o.open and not o.busy:
+					online += 1
+					if o.game != 0:
+						playing += 1
+					elif o.queue != "":
+						looking += 1
+			_send(p, {"type": "stats", "online": online, "playing": playing, "looking": looking})
 		"host":
 			_host(p)
 		"join":
