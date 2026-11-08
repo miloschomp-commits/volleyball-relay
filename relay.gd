@@ -11,7 +11,8 @@ extends SceneTree
 #    CASUAL    Players (or a party of two) ask for a match with some rules: 1 v 1 or
 #              2 v 2, the mode, the points. Once enough want the same, they're put in a GAME.
 #    TOURNEYS  Teams (one player; a party of two; or two strangers paired up) wait until
-#              BRACKET teams are in, then play a knockout. The server starts each match,
+#              BRACKET teams are in, then play a knockout (or, after FILL_WAIT with only 2,
+#              a straight final). The server starts each match,
 #              hears who won, and tells everyone where they finished (rank points).
 #
 #  Every computer in a match runs it, and they send each other their buttons; this server
@@ -25,6 +26,9 @@ extends SceneTree
 
 const PARTY_MAX := 4
 const BRACKET := 4              # teams in a tourney (4, 8, 16...): 4 = two semi-finals, then the final
+# A tourney's first team has waited this long and BRACKET haven't come: the first 2 teams play a
+# straight final (-- --fill=seconds changes it, for testing)
+const FILL_WAIT := 60.0
 const TOURNEY_RULES := {"mode": "Classic", "points": 11, "strict": true}     # strict: net touch, no double touches
 # Casual: the fun modes and courts a match may ask for (the game's Game.MODES and Game.SCENES)
 const MODES := ["Classic", "Big Ball", "Windy", "Spin Madness", "Rally Rush", "Hot Potato", "Heavy Ball", "Ghost Ball",
@@ -47,6 +51,7 @@ var lag := 0.0                  # testing: hold game bytes back this long (-- --
 # told the server's full (a small server stays smooth for those on it, rather than lagging for all)
 var max_players := 300
 var held_back: Array = []       # [when to send, peer, bytes]
+var fill_wait := FILL_WAIT
 
 
 func _initialize() -> void:
@@ -62,6 +67,8 @@ func _initialize() -> void:
 			port = int(arg.trim_prefix("--port="))
 		if arg.begins_with("--lag="):
 			lag = int(arg.trim_prefix("--lag=")) / 1000.0
+		if arg.begins_with("--fill="):
+			fill_wait = float(arg.trim_prefix("--fill="))
 	Engine.max_fps = 120                         # plenty, without spinning the CPU
 	var err := server.listen(port, "*")
 	print("Volleyball relay %s on port %d" % ["listening" if err == OK else "FAILED (%d)" % err, port])
@@ -90,6 +97,9 @@ func _process(delta: float) -> bool:
 			peers.erase(p)
 	for t: Dictionary in tourneys.values():
 		_tourney_step(t)
+	for key: String in queues.keys():
+		if key.begins_with("tourney"):
+			_tourney_early(key)
 	while not held_back.is_empty() and held_back[0][0] <= clock:
 		var late: Array = held_back.pop_front()
 		_send_now(late[1], late[2])
@@ -405,7 +415,21 @@ func _enqueue(key: String, group: Array) -> void:
 	queues[key].append(group)
 	for m: Dictionary in group:
 		m.queue = key
+		m.queued_at = clock
 	_queue_update(key)
+
+
+## A tourney that hasn't filled: once its first team has waited fill_wait, the first 2 teams
+## play a straight final.
+func _tourney_early(key: String) -> void:
+	var waiting: Array = queues.get(key, [])
+	if waiting.is_empty() or clock - float(waiting[0][0].get("queued_at", clock)) < fill_wait:
+		return
+	var per_team := 1 if key == "tourney|solo" else 2
+	var found := _form_teams(waiting, per_team, 2)
+	if not found.is_empty():
+		_dequeue(key, found.used)
+		_start_tourney(found.teams, per_team)
 
 
 func _dequeue(key: String, groups: Array) -> void:
@@ -459,6 +483,8 @@ func _queue_update(key: String) -> void:
 	if key.begins_with("tourney"):
 		msg.teams = teams
 		msg.need = BRACKET
+		# seconds till the 2 teams here play a final instead (once there are 2)
+		msg.early = maxf(fill_wait - (clock - float(waiting[0][0].get("queued_at", clock))), 0.0) if teams >= 2 else -1.0
 	for g: Array in waiting:
 		for m: Dictionary in g:
 			_send(m, msg)
@@ -568,7 +594,7 @@ func _start_tourney(teams: Array, per_team: int) -> void:
 		t.names.append(" & ".join(team.map(func(m): return m.name)))
 		for m: Dictionary in team:
 			m.tourney = t.id
-	for i in BRACKET / 2:
+	for i in teams.size() / 2:
 		t.results[0].append(-1)
 		t.since[i] = clock
 	tourneys[t.id] = t
@@ -624,7 +650,7 @@ func _tourney_win(t: Dictionary, i: int, winner: int) -> void:
 	t.results[r][i] = winner
 	t.games.erase(i)
 	var loser: int = pair[1] if winner == pair[0] else pair[0]
-	_placed(t, loser, (BRACKET >> (r + 1)) + 1)       # out in the final: 2nd; in the semis: 3rd...
+	_placed(t, loser, ((t.teams as Array).size() >> (r + 1)) + 1)       # out in the final: 2nd; in the semis: 3rd...
 	if not (t.results[r] as Array).has(-1):
 		if (t.results[r] as Array).size() == 1:
 			_placed(t, winner, 1)
@@ -645,7 +671,7 @@ func _placed(t: Dictionary, team: int, place: int) -> void:
 	for m: Dictionary in t.teams[team]:
 		t.out[m.id] = place
 	for m: Dictionary in _present(t, team):
-		_send(m, {"type": "placed", "place": place, "of": BRACKET})
+		_send(m, {"type": "placed", "place": place, "of": (t.teams as Array).size()})
 
 
 ## Everyone in the tourney sees the bracket: the teams, each round's matches and winners.
@@ -660,7 +686,7 @@ func _send_bracket(t: Dictionary) -> void:
 	for k in (t.teams as Array).size():
 		for m: Dictionary in _present(t, k):
 			_send(m, {"type": "bracket", "names": t.names, "rounds": rounds, "you": k, "round": t.round,
-				"size": BRACKET, "done": t.done})
+				"size": (t.teams as Array).size(), "done": t.done})
 
 
 func _leave_tourney(p: Dictionary) -> void:
