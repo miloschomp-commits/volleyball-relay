@@ -33,7 +33,7 @@ const TOURNEY_RULES := {"mode": "Classic", "points": 11, "strict": true}     # s
 # Casual: the fun modes and courts a match may ask for (the game's Game.MODES and Game.SCENES)
 const MODES := ["Classic", "Big Ball", "Windy", "Spin Madness", "Rally Rush", "Hot Potato", "Heavy Ball", "Ghost Ball",
 	"Chaos", "Mega Chaos"]
-const SCENES := ["Beach", "Grass", "Sky"]
+const SCENES := ["Beach", "Grass", "Gym", "Sky"]
 const GRACE := 45.0             # how long a tourney match waits for players still reading their last Game Over
 const LETTERS := "ABCDEFGHJKMNPQRSTUVWXYZ"     # no I, L or O: they look like 1 and 0
 const NAME_CHARS := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
